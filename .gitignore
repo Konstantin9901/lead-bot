@@ -1,0 +1,25 @@
+# Виртуальное окружение
+venv/
+__pycache__/
+*.pyc
+
+# Секреты и сессии
+.env
+*.session
+*.session-journal
+
+# Логи
+*.log
+
+# Базы данных
+*.db
+*.sqlite
+
+# ML-модели (если есть)
+*.pkl
+*.joblib
+*.bin
+
+# IDE
+.vscode/
+.idea/

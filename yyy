@@ -1,0 +1,86 @@
+import asyncio
+import os
+import threading
+from dotenv import load_dotenv
+from telethon import TelegramClient, events
+from telegram import Update, ReplyKeyboardMarkup
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
+from filters import is_buy_lead
+
+load_dotenv()
+
+API_ID = int(os.getenv("API_ID"))
+API_HASH = os.getenv("API_HASH")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+OWNER_ID = int(os.getenv("OWNER_ID"))
+
+client = TelegramClient("session", API_ID, API_HASH)
+message_queue = asyncio.Queue()
+filter_enabled = True  # Фильтр включён по умолчанию
+
+# --- Telethon слушает чаты ---
+@client.on(events.NewMessage)
+async def handler(event):
+    global filter_enabled
+
+    sender = await event.get_sender()
+    if sender.id == OWNER_ID:
+    print("🔁 Пропущено сообщение от владельца (защита от цикла)")
+    return
+
+    text = event.message.message
+    if filter_enabled and is_buy_lead(text):
+        await message_queue.put(text)
+
+# --- Telegram-бот ---
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [["🟢 Включить фильтр"], ["🔴 Выключить фильтр"]]
+    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+    await update.message.reply_text(
+        "Привет! Я бот для лидов по недвижимости.\nВыбери действие:",
+        reply_markup=reply_markup
+    )
+
+async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global filter_enabled
+    text = update.message.text
+
+    if "Включить фильтр" in text:
+        filter_enabled = True
+        await update.message.reply_text("✅ Фильтр включён. Буду пересылать релевантные лиды.")
+    elif "Выключить фильтр" in text:
+        filter_enabled = False
+        await update.message.reply_text("⛔️ Фильтр выключен. Пересылка приостановлена.")
+
+# --- Пересылка сообщений ---
+async def relay_messages(app):
+    while True:
+        msg = await message_queue.get()
+        print(f"📤 Получено сообщение для пересылки: {msg}")
+        await app.bot.send_message(chat_id=OWNER_ID, text=f"🏠 Новый лид:\n{msg}")
+
+# --- Запуск Telegram-бота ---
+def run_telegram_bot():
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_buttons))
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    loop.create_task(relay_messages(app))
+    app.run_polling()
+
+# --- Запуск Telethon и Telegram-бота ---
+async def main():
+    threading.Thread(target=run_telegram_bot, daemon=True).start()
+    await client.start()
+    await client.run_until_disconnected()
+
+asyncio.run(main())

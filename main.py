@@ -16,7 +16,8 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
-from filters import is_buy_lead   # ваша логика фильтрации
+from filters import is_buy_lead
+from bis_cx_api import send_lead, BIS_CX_CAMPAIGN_ID  # ← НОВЫЙ ИМПОРТ
 
 # Настройка логирования
 logging.basicConfig(
@@ -31,7 +32,7 @@ API_HASH = os.getenv("API_HASH")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OWNER_ID = int(os.getenv("OWNER_ID"))
 
-# Клиент Telethon (использует существующий файл сессии)
+# Клиент Telethon
 client = TelegramClient("keyword_session", API_ID, API_HASH)
 bot = Bot(token=BOT_TOKEN)
 
@@ -53,8 +54,14 @@ startup_counter = 0
 PROCESS_DELAY = 1.0
 RANDOM_DELAY_VARIATION = 0.5
 
+# ========== СТАТИСТИКА ДЛЯ BIS CX (ЛИДЫ) ==========
+leads_buffer = []  # буфер для накопления лидов
+LEADS_BATCH_SIZE = 5  # отправлять пачкой по 5 лидов
+
+
 def hash_text(text):
     return hashlib.md5(text.encode("utf-8")).hexdigest()
+
 
 @client.on(events.NewMessage)
 async def handle_telethon_message(event):
@@ -101,7 +108,9 @@ async def handle_telethon_message(event):
         await message_queue.put((original_text, sender_id, chat_id, message_id, timestamp))
         logger.info(f"Добавлено в очередь: {msg_key}")
 
+
 async def relay_messages():
+    global leads_buffer
     while True:
         try:
             text, sender_id, chat_id, message_id, timestamp = await message_queue.get()
@@ -142,6 +151,24 @@ async def relay_messages():
                 reply_markup=markup
             )
             logger.info("Сообщение успешно отправлено владельцу.")
+            
+            # ========== ОТПРАВКА ЛИДА В BIS CX ==========
+            # Добавляем лид в буфер
+            leads_buffer.append({
+                "user_id": sender_id,
+                "external_id": f"{chat_id}_{message_id}_{timestamp.timestamp()}"
+            })
+            logger.info(f"Лид добавлен в буфер: user_id={sender_id}, buffer_size={len(leads_buffer)}")
+            
+            # Если накопилось достаточно лидов — отправляем пачкой
+            if len(leads_buffer) >= LEADS_BATCH_SIZE:
+                from bis_cx_api import send_lead_batch
+                logger.info(f"Отправка пачки из {len(leads_buffer)} лидов")
+                results = send_lead_batch(BIS_CX_CAMPAIGN_ID, leads_buffer)
+                successful = sum(1 for r in results if r.get("status") == "ok")
+                logger.info(f"Отправлено лидов: {successful}/{len(leads_buffer)}")
+                leads_buffer = []
+            
         except FloodWaitError as e:
             wait_seconds = e.seconds
             logger.warning(f"Flood wait: нужно подождать {wait_seconds} сек.")
@@ -150,6 +177,21 @@ async def relay_messages():
             logger.error(f"Ошибка отправки: {e}")
             pending_messages.append((text, sender_id, chat_id, message_id, timestamp))
             await asyncio.sleep(5)
+
+
+async def periodic_flush_leads():
+    """Каждые 5 минут отправляет накопившиеся лиды, даже если не набралась пачка"""
+    global leads_buffer
+    while True:
+        await asyncio.sleep(300)  # 5 минут
+        if leads_buffer:
+            logger.info(f"Периодическая отправка {len(leads_buffer)} лидов")
+            from bis_cx_api import send_lead_batch
+            results = send_lead_batch(BIS_CX_CAMPAIGN_ID, leads_buffer)
+            successful = sum(1 for r in results if r.get("status") == "ok")
+            logger.info(f"Отправлено лидов: {successful}/{len(leads_buffer)}")
+            leads_buffer = []
+
 
 async def retry_pending():
     while True:
@@ -202,6 +244,7 @@ async def retry_pending():
                     pending_messages.remove(item)
                     logger.info("Удалено из буфера: невозможно получить entity")
 
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [["🟢 Включить фильтр"], ["🔴 Выключить фильтр"]]
     reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
@@ -209,6 +252,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Привет! Я бот для лидов по недвижимости.\nВыбери действие:",
         reply_markup=reply_markup
     )
+
 
 async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global filter_enabled
@@ -220,6 +264,7 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         filter_enabled = False
         await update.message.reply_text("⛔️ Фильтр выключен.")
 
+
 async def run_telegram_bot():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
@@ -230,15 +275,18 @@ async def run_telegram_bot():
     while True:
         await asyncio.sleep(1)
 
+
 async def main():
-    await client.start()  # использует существующую сессию keyword_session.session
+    await client.start()
     logger.info("Telethon клиент запущен.")
     await asyncio.gather(
         client.run_until_disconnected(),
         relay_messages(),
         retry_pending(),
-        run_telegram_bot()
+        run_telegram_bot(),
+        periodic_flush_leads()  # ← отправка накопившихся лидов каждые 5 минут
     )
+
 
 if __name__ == "__main__":
     asyncio.run(main())

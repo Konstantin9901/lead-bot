@@ -1,3 +1,5 @@
+import nest_asyncio
+nest_asyncio.apply()
 import asyncio
 import os
 import hashlib
@@ -41,39 +43,29 @@ def hash_text(text):
 async def handle_all_messages(event):
     global filter_enabled
     
-    # Логируем всё
     logger.info(f"📨 Сообщение от {event.chat_id}: {event.message.text}")
     
-    # Обрабатываем команды от владельца
     if event.chat_id == OWNER_ID:
         text = event.message.text
         
         if text == "/start":
             await event.reply("🤖 Бот работает! /on - включить, /off - выключить, /stats - статистика")
             logger.info("✅ Ответил на /start")
-        
         elif text == "/on":
             filter_enabled = True
             await event.reply("✅ Фильтр включён")
-        
         elif text == "/off":
             filter_enabled = False
             await event.reply("⛔️ Фильтр выключен")
-        
         elif text == "/stats":
             await event.reply(f"Фильтр: {'ВКЛ' if filter_enabled else 'ВЫКЛ'}\nОчередь: {message_queue.qsize()}\nБуфер: {len(leads_buffer)}")
-        
         return
     
-    # Чтение каналов (остальная логика)
     if event.out or not event.is_channel:
         return
     
     text = event.message.text
-    if not text:
-        return
-    
-    if any(emoji in text for emoji in ["💬", "🔁", "🕒"]):
+    if not text or any(emoji in text for emoji in ["💬", "🔁", "🕒"]):
         return
     
     msg_hash = hash_text(text)
@@ -101,23 +93,14 @@ async def sender():
     while True:
         try:
             text, user_id, chat_id, msg_id = await message_queue.get()
-            
-            delay = PROCESS_DELAY + random.uniform(0, RANDOM_DELAY)
-            await asyncio.sleep(delay)
-            
+            await asyncio.sleep(PROCESS_DELAY + random.uniform(0, RANDOM_DELAY))
             await client.send_message(OWNER_ID, f"🔔 {text}")
             logger.info("✉️ Отправлено в Telegram")
-            
-            leads_buffer.append({
-                "user_id": user_id,
-                "external_id": f"{chat_id}_{msg_id}_{int(datetime.now().timestamp())}"
-            })
-            
+            leads_buffer.append({"user_id": user_id, "external_id": f"{chat_id}_{msg_id}_{int(datetime.now().timestamp())}"})
             if len(leads_buffer) >= LEADS_BATCH_SIZE:
                 send_lead_batch(BIS_CX_CAMPAIGN_ID, leads_buffer)
                 logger.info(f"📦 Отправлено {len(leads_buffer)} лидов в BIS CX")
                 leads_buffer = []
-                
         except FloodWaitError as e:
             logger.warning(f"⏳ FloodWait: {e.seconds} сек")
             await asyncio.sleep(e.seconds)

@@ -1,0 +1,4 @@
+telethon
+python-dotenv
+nest_asyncio
+flask

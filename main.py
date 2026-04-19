@@ -11,7 +11,7 @@ from collections import deque
 from telethon import TelegramClient, events
 from telethon.errors import FloodWaitError
 from filters import is_buy_lead
-from bis_cx_stats import send_lead_batch, BIS_CX_CAMPAIGN_ID
+from db import init_db, is_subscription_active, activate_subscription, add_payment_record
 
 logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -29,14 +29,15 @@ filter_enabled = True
 seen_hashes = deque(maxlen=10000)
 startup_time = datetime.now(timezone.utc)
 startup_counter = 0
-leads_buffer = []
-LEADS_BATCH_SIZE = 5
 
 PROCESS_DELAY = 1.5
 RANDOM_DELAY = 1.0
 
 def hash_text(text):
     return hashlib.md5(text.encode("utf-8")).hexdigest()
+
+# Инициализация БД
+init_db()
 
 # ========== КОМАНДЫ ДЛЯ ВЛАДЕЛЬЦА ==========
 @client.on(events.NewMessage)
@@ -49,16 +50,49 @@ async def handle_all_messages(event):
         text = event.message.text
         
         if text == "/start":
-            await event.reply("🤖 Бот работает! /on - включить, /off - выключить, /stats - статистика")
-            logger.info("✅ Ответил на /start")
+            await event.reply(
+                "🤖 *LidBot Pro*\n\n"
+                "Бот собирает лиды из Telegram-каналов по ключевым словам.\n\n"
+                "📌 *Команды:*\n"
+                "/on - включить фильтр\n"
+                "/off - выключить фильтр\n"
+                "/stats - статистика\n"
+                "/subscribe - купить подписку ($50/мес)",
+                parse_mode="markdown"
+            )
+        
         elif text == "/on":
             filter_enabled = True
             await event.reply("✅ Фильтр включён")
+        
         elif text == "/off":
             filter_enabled = False
             await event.reply("⛔️ Фильтр выключен")
+        
         elif text == "/stats":
-            await event.reply(f"Фильтр: {'ВКЛ' if filter_enabled else 'ВЫКЛ'}\nОчередь: {message_queue.qsize()}\nБуфер: {len(leads_buffer)}")
+            await event.reply(
+                f"📊 *Статистика*\n\n"
+                f"Фильтр: {'✅ ВКЛ' if filter_enabled else '❌ ВЫКЛ'}\n"
+                f"Очередь: {message_queue.qsize()}\n"
+                f"Подписка: {'✅ Активна' if is_subscription_active(OWNER_ID) else '❌ Не активна'}",
+                parse_mode="markdown"
+            )
+        
+        elif text == "/subscribe":
+            # Временная заглушка — позже заменим на ссылку Paddle
+            await event.reply(
+                "💳 *Оплата подписки*\n\n"
+                "Стоимость: $50/месяц\n\n"
+                "Ссылка для оплаты: https://paddle.com/checkout/...\n\n"
+                "После оплаты подписка активируется автоматически.",
+                parse_mode="markdown"
+            )
+        
+        return
+    
+    # Чтение каналов (только если подписка активна)
+    if not is_subscription_active(OWNER_ID):
+        logger.warning("❌ Подписка не активна, лиды не обрабатываются")
         return
     
     if event.out or not event.is_channel:
@@ -87,20 +121,21 @@ async def handle_all_messages(event):
         await message_queue.put((text, event.sender_id or event.chat_id, event.chat_id, event.message.id))
         logger.info(f"✅ ЛИД: {text[:80]}...")
 
-# ========== ОТПРАВКА ==========
+# ========== ОТПРАВКА ЛИДОВ ==========
 async def sender():
-    global leads_buffer
     while True:
         try:
             text, user_id, chat_id, msg_id = await message_queue.get()
+            
+            # Проверка подписки перед отправкой
+            if not is_subscription_active(OWNER_ID):
+                logger.warning("❌ Подписка не активна, лид не отправлен")
+                continue
+            
             await asyncio.sleep(PROCESS_DELAY + random.uniform(0, RANDOM_DELAY))
             await client.send_message(OWNER_ID, f"🔔 {text}")
-            logger.info("✉️ Отправлено в Telegram")
-            leads_buffer.append({"user_id": user_id, "external_id": f"{chat_id}_{msg_id}_{int(datetime.now().timestamp())}"})
-            if len(leads_buffer) >= LEADS_BATCH_SIZE:
-                send_lead_batch(BIS_CX_CAMPAIGN_ID, leads_buffer)
-                logger.info(f"📦 Отправлено {len(leads_buffer)} лидов в BIS CX")
-                leads_buffer = []
+            logger.info("✉️ Лид отправлен в Telegram")
+            
         except FloodWaitError as e:
             logger.warning(f"⏳ FloodWait: {e.seconds} сек")
             await asyncio.sleep(e.seconds)
@@ -108,21 +143,30 @@ async def sender():
             logger.error(f"❌ Ошибка: {e}")
             await asyncio.sleep(5)
 
-async def periodic():
-    global leads_buffer
-    while True:
-        await asyncio.sleep(300)
-        if leads_buffer:
-            send_lead_batch(BIS_CX_CAMPAIGN_ID, leads_buffer)
-            leads_buffer = []
-
+# ========== ЗАПУСК ==========
 async def main():
     await client.start()
-    logger.info("🚀 БОТ ЗАПУЩЕН")
-    await client.send_message(OWNER_ID, "🚀 Бот запущен и готов к работе!\n\n/start - приветствие\n/on - включить фильтр\n/off - выключить")
-    await asyncio.gather(client.run_until_disconnected(), sender(), periodic())
+    logger.info("🚀 LIDBOT PRO ЗАПУЩЕН")
+    await client.send_message(
+        OWNER_ID,
+        "🚀 *LidBot Pro запущен!*\n\n"
+        "📌 Команды:\n"
+        "/start - приветствие\n"
+        "/on - включить фильтр\n"
+        "/off - выключить фильтр\n"
+        "/stats - статистика\n"
+        "/subscribe - купить подписку",
+        parse_mode="markdown"
+    )
+    await asyncio.gather(client.run_until_disconnected(), sender())
 
-asyncio.run(main())
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("👋 Остановлен")
+    except Exception as e:
+        logger.error(f"❌ Ошибка: {e}")
 
 
 

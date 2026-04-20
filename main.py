@@ -22,7 +22,7 @@ API_HASH = os.getenv("API_HASH")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OWNER_ID = int(os.getenv("OWNER_ID"))
 
-client = TelegramClient("bot_session", API_ID, API_HASH).start(bot_token=BOT_TOKEN)
+client = TelegramClient("user_session", API_ID, API_HASH).start()
 
 message_queue = asyncio.Queue()
 filter_enabled = True

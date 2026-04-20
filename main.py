@@ -40,6 +40,7 @@ async def handle_all_messages(event):
     
     logger.info(f"📨 Сообщение от {event.chat_id}: {event.message.text}")
     
+    # Команды от владельца
     if event.chat_id == OWNER_ID:
         text = event.message.text
         if text == "/start":
@@ -51,9 +52,10 @@ async def handle_all_messages(event):
             filter_enabled = False
             await event.reply("⛔️ Фильтр выключен")
         elif text == "/stats":
-            await event.reply(f"Фильтр: {'ВКЛ' if filter_enabled else 'ВЫКЛ'}\nОчередь: {message_queue.qsize()}")
+            await event.reply(f"📊 Статистика\nФильтр: {'ВКЛ' if filter_enabled else 'ВЫКЛ'}\nОчередь: {message_queue.qsize()}")
         return
     
+    # Игнорируем свои сообщения и не-каналы
     if event.out or not event.is_channel:
         return
     
@@ -61,11 +63,13 @@ async def handle_all_messages(event):
     if not text or any(emoji in text for emoji in ["💬", "🔁", "🕒"]):
         return
     
+    # Защита от дубликатов
     msg_hash = hash_text(text)
     if msg_hash in seen_hashes:
         return
     seen_hashes.append(msg_hash)
     
+    # Защита при старте
     if datetime.now(timezone.utc) - startup_time < timedelta(seconds=10):
         startup_counter += 1
         if startup_counter > 20:
@@ -76,22 +80,26 @@ async def handle_all_messages(event):
     if not filter_enabled:
         return
     
+    # Проверка на лида
     if is_buy_lead(text):
         await message_queue.put((text, event.sender_id or event.chat_id))
         logger.info(f"✅ ЛИД: {text[:80]}...")
 
 async def sender():
+    """Отправка лидов в Telegram владельцу"""
     while True:
         try:
             text, user_id = await message_queue.get()
+            # Случайная задержка
             await asyncio.sleep(PROCESS_DELAY + random.uniform(0, RANDOM_DELAY))
+            # Отправка в Telegram
             await client.send_message(OWNER_ID, f"🔔 {text}")
-            logger.info("✉️ Лид отправлен")
+            logger.info("✉️ Лид отправлен в Telegram")
         except FloodWaitError as e:
             logger.warning(f"⏳ FloodWait: {e.seconds} сек")
             await asyncio.sleep(e.seconds)
         except Exception as e:
-            logger.error(f"❌ Ошибка: {e}")
+            logger.error(f"❌ Ошибка в sender: {e}")
             await asyncio.sleep(5)
 
 async def main():

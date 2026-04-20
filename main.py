@@ -1,15 +1,14 @@
-import nest_asyncio
-nest_asyncio.apply()
 import asyncio
 import os
 import hashlib
-import random
 import logging
 from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 from collections import deque
 from telethon import TelegramClient, events
 from telethon.errors import FloodWaitError
+from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update, ReplyKeyboardMarkup
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 from filters import is_buy_lead
 
 logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
@@ -18,103 +17,174 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 OWNER_ID = int(os.getenv("OWNER_ID"))
 
-client = TelegramClient("user_session", API_ID, API_HASH).start()
+client = TelegramClient("keyword_session", API_ID, API_HASH)
+bot = Bot(token=BOT_TOKEN)
 
 message_queue = asyncio.Queue()
+pending_messages = []
 filter_enabled = True
+seen_ids = set()
 seen_hashes = deque(maxlen=10000)
 startup_time = datetime.now(timezone.utc)
+startup_limit = 20
 startup_counter = 0
-
-PROCESS_DELAY = 1.5
-RANDOM_DELAY = 1.0
 
 def hash_text(text):
     return hashlib.md5(text.encode("utf-8")).hexdigest()
 
 @client.on(events.NewMessage)
-async def handle_all_messages(event):
+async def handle_telethon_message(event):
     global filter_enabled, startup_counter
-    
-    logger.info(f"📨 Сообщение от {event.chat_id}: {event.message.text}")
-    
-    # Команды от владельца
-    if event.chat_id == OWNER_ID:
-        text = event.message.text
-        if text == "/start":
-            await event.reply("🤖 Бот работает! /on - включить, /off - выключить, /stats - статистика")
-        elif text == "/on":
-            filter_enabled = True
-            await event.reply("✅ Фильтр включён")
-        elif text == "/off":
-            filter_enabled = False
-            await event.reply("⛔️ Фильтр выключен")
-        elif text == "/stats":
-            await event.reply(f"📊 Статистика\nФильтр: {'ВКЛ' if filter_enabled else 'ВЫКЛ'}\nОчередь: {message_queue.qsize()}")
+
+    sender_id = event.message.sender_id
+    chat_id = event.chat_id
+    message_id = event.message.id
+    original_text = event.message.message.strip() if event.message.message else ""
+    timestamp = event.message.date
+
+    me = await client.get_me()
+    if sender_id == me.id or chat_id == OWNER_ID:
         return
-    
-    # Игнорируем свои сообщения и не-каналы
-    if event.out or not event.is_channel:
+
+    if any(emoji in original_text for emoji in ["💬", "🔁", "🕒"]):
         return
-    
-    text = event.message.text
-    if not text or any(emoji in text for emoji in ["💬", "🔁", "🕒"]):
+
+    msg_key = (chat_id, message_id)
+    msg_hash = hash_text(original_text)
+
+    logger.info(f"📥 Получено: ID={message_id}, chat={chat_id}")
+
+    if msg_key in seen_ids or msg_hash in seen_hashes:
+        logger.info(f"⛔️ Повтор: {msg_key}")
         return
-    
-    # Защита от дубликатов
-    msg_hash = hash_text(text)
-    if msg_hash in seen_hashes:
-        return
+
+    seen_ids.add(msg_key)
     seen_hashes.append(msg_hash)
-    
-    # Защита при старте
+
+    if timestamp < datetime.now(timezone.utc) - timedelta(seconds=30):
+        logger.info("⛔️ Старое сообщение")
+        return
+
     if datetime.now(timezone.utc) - startup_time < timedelta(seconds=10):
         startup_counter += 1
-        if startup_counter > 20:
+        if startup_counter > startup_limit:
             return
-    
-    logger.info(f"📩 {text[:80]}...")
-    
-    if not filter_enabled:
-        return
-    
-    # Проверка на лида
-    if is_buy_lead(text):
-        await message_queue.put((text, event.sender_id or event.chat_id))
-        logger.info(f"✅ ЛИД: {text[:80]}...")
 
-async def sender():
-    """Отправка лидов в Telegram владельцу"""
+    if filter_enabled and is_buy_lead(original_text):
+        await message_queue.put((original_text, sender_id, chat_id, message_id, timestamp))
+        logger.info(f"✅ Добавлено в очередь")
+
+async def relay_messages():
     while True:
+        text, sender_id, chat_id, message_id, timestamp = await message_queue.get()
         try:
-            text, user_id = await message_queue.get()
-            # Случайная задержка
-            await asyncio.sleep(PROCESS_DELAY + random.uniform(0, RANDOM_DELAY))
-            # Отправка в Telegram
-            await client.send_message(OWNER_ID, f"🔔 {text}")
-            logger.info("✉️ Лид отправлен в Telegram")
+            username = None
+            try:
+                sender = await client.get_entity(sender_id)
+                username = getattr(sender, "username", None)
+            except Exception as e:
+                logger.warning(f"Не удалось получить username: {e}")
+
+            user_link = f"https://t.me/{username}" if username else None
+            message_link = f"https://t.me/c/{str(chat_id)[4:]}/{message_id}" if str(chat_id).startswith("-100") else None
+
+            buttons = []
+            if user_link:
+                buttons.append(InlineKeyboardButton("👤 Отправитель", url=user_link))
+            if message_link:
+                buttons.append(InlineKeyboardButton("📎 Оригинал", url=message_link))
+
+            markup = InlineKeyboardMarkup([buttons]) if buttons else None
+
+            await bot.send_message(chat_id=OWNER_ID, text=text, reply_markup=markup)
+            logger.info("📤 Сообщение отправлено")
         except FloodWaitError as e:
-            logger.warning(f"⏳ FloodWait: {e.seconds} сек")
+            logger.warning(f"FloodWait: {e.seconds} сек")
             await asyncio.sleep(e.seconds)
         except Exception as e:
-            logger.error(f"❌ Ошибка в sender: {e}")
-            await asyncio.sleep(5)
+            logger.error(f"Ошибка: {e}")
+            pending_messages.append((text, sender_id, chat_id, message_id, timestamp))
+
+async def retry_pending():
+    while True:
+        await asyncio.sleep(30)
+        for item in pending_messages[:]:
+            text, sender_id, chat_id, message_id, timestamp = item
+            try:
+                username = None
+                try:
+                    sender = await client.get_entity(sender_id)
+                    username = getattr(sender, "username", None)
+                except Exception:
+                    pass
+
+                user_link = f"https://t.me/{username}" if username else None
+                message_link = f"https://t.me/c/{str(chat_id)[4:]}/{message_id}" if str(chat_id).startswith("-100") else None
+
+                buttons = []
+                if user_link:
+                    buttons.append(InlineKeyboardButton("👤 Отправитель", url=user_link))
+                if message_link:
+                    buttons.append(InlineKeyboardButton("📎 Оригинал", url=message_link))
+
+                markup = InlineKeyboardMarkup([buttons]) if buttons else None
+
+                await bot.send_message(chat_id=OWNER_ID, text=text, reply_markup=markup)
+                pending_messages.remove(item)
+                logger.info("🔁 Отправлено из буфера")
+            except Exception as e:
+                logger.warning(f"Повтор не удался: {e}")
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [["🟢 Включить фильтр"], ["🔴 Выключить фильтр"], ["📊 Статистика"]]
+    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+    await update.message.reply_text(
+        "Привет! Я бот для лидов по недвижимости.\nВыбери действие:",
+        reply_markup=reply_markup
+    )
+
+async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global filter_enabled
+    text = update.message.text
+    if "Включить фильтр" in text:
+        filter_enabled = True
+        await update.message.reply_text("✅ Фильтр включён.")
+    elif "Выключить фильтр" in text:
+        filter_enabled = False
+        await update.message.reply_text("⛔️ Фильтр выключен.")
+    elif "Статистика" in text:
+        await update.message.reply_text(
+            f"📊 Статистика:\n"
+            f"Фильтр: {'ВКЛ' if filter_enabled else 'ВЫКЛ'}\n"
+            f"Очередь: {message_queue.qsize()}\n"
+            f"Буфер повторов: {len(pending_messages)}"
+        )
+
+async def run_telegram_bot():
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_buttons))
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling()
+    while True:
+        await asyncio.sleep(1)
 
 async def main():
     await client.start()
     logger.info("🚀 БОТ ЗАПУЩЕН")
-    await client.send_message(OWNER_ID, "🚀 Бот запущен и готов к работе!\n\n/start - приветствие\n/on - включить фильтр\n/off - выключить\n/stats - статистика")
-    await asyncio.gather(client.run_until_disconnected(), sender())
+    await asyncio.gather(
+        client.run_until_disconnected(),
+        relay_messages(),
+        retry_pending(),
+        run_telegram_bot()
+    )
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("👋 Остановлен")
-    except Exception as e:
-        logger.error(f"❌ Ошибка: {e}")
+    asyncio.run(main())
 
 
 

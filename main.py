@@ -64,7 +64,7 @@ async def handle_telethon_message(event):
     seen_ids.add(msg_key)
     seen_hashes.append(msg_hash)
 
-    if timestamp < datetime.now(timezone.utc) - timedelta(seconds=30):
+    if timestamp < datetime.now(timezone.utc) - timedelta(seconds=300):
         logger.info("⛔️ Старое сообщение")
         return
 
